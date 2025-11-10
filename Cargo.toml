@@ -4,9 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-anyhow = "1.0.100"
 ble-peripheral-rust = { git = "https://github.com/Tiggilyboo/ble-peripheral-rust" }
-crossterm = "0.29.0"
-evdev = "0.13.2"
-tokio = "1.48.0"
-uuid = "1.18.1"
+anyhow = "1.0"
+tokio = "1.48"
+uuid = "1.18"
+winit = "0.30"
+softbuffer = "0.4"

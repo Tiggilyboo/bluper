@@ -1,14 +1,5 @@
-//! BluePointer: BLE HID passthrough for mouse + keyboard
-//! - BLE owner task owns the Peripheral
-//! - stdin task (crossterm) -> AppCmd
-//! - evdev task (reads /dev/input/event* devices) -> AppCmd
-
-use std::{collections::BTreeSet, time::Duration};
-
-use crossterm::execute;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use evdev::{EventType, KeyCode, RelativeAxisCode};
-use tokio::{select, sync::mpsc, task, time::sleep};
+use std::{collections::BTreeSet, num::NonZeroU32};
+use tokio::{select, sync::mpsc};
 use uuid::Uuid;
 
 use ble_peripheral_rust::{
@@ -23,6 +14,15 @@ use ble_peripheral_rust::{
         service::Service,
     },
     uuid::ShortUuid,
+};
+use softbuffer::{Context as SbContext, Surface as SbSurface};
+use winit::{
+    application::ApplicationHandler,
+    dpi::PhysicalSize,
+    event::{ElementState, MouseScrollDelta, WindowEvent},
+    event_loop,
+    keyboard::{KeyCode, ModifiersState, PhysicalKey},
+    window::Window,
 };
 
 /// === UUIDs ===
@@ -40,37 +40,416 @@ const UUID_REPORT_REF_DESC: u16 = 0x2908;
 const UUID_BATTERY_LEVEL: u16 = 0x2A19;
 const UUID_MFG_NAME: u16 = 0x2A29;
 const UUID_MODEL_NUM: u16 = 0x2A24;
+const PERIPHERAL_NAME: &str = "Bluper";
+const PERIPHERAL_APPEARANCE: u16 = 0x03C0;
 
 /// === Report IDs ===
 const RID_MOUSE: u8 = 0x01;
 const RID_KEYBD: u8 = 0x02;
 
-/// === App->BLE owner commands ===
 #[derive(Debug)]
 enum AppCmd {
-    /// mouse: buttons bitfield (bit0..2 left/middle/right), dx, dy, wheel
     Mouse {
         buttons: u8,
         dx: i8,
         dy: i8,
         wheel: i8,
     },
-    /// keyboard key down/up (HID usage)
     KeyDown(u8),
     KeyUp(u8),
-    /// set battery level (0-100)
     Battery(u8),
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    // Channel for app commands -> BLE owner
-    let (cmd_tx, mut cmd_rx) = mpsc::channel::<AppCmd>(512);
-    // Channel for BLE events
-    let (evt_tx, mut evt_rx) = mpsc::channel::<PeripheralEvent>(512);
+struct App {
+    window: Option<Window>,
+    cmd_tx: mpsc::Sender<AppCmd>, // bounded (uses try_send in callbacks)
+    mouse_buttons: u8,            // bit0..2
+    cursor_last: Option<(f64, f64)>,
+    wheel_px_accum: f64,
+    mods_winit: ModifiersState,
+    hid_mod_mask: u8,
+    size: PhysicalSize<u32>,
+    exiting: bool,
+}
 
-    // ---------- Build GATT ----------
-    let (hid_service, report_char_uuid) = build_hid_services();
+impl App {
+    fn new(cmd_tx: mpsc::Sender<AppCmd>) -> Self {
+        Self {
+            window: None,
+            cmd_tx,
+            mouse_buttons: 0,
+            cursor_last: None,
+            wheel_px_accum: 0.0,
+            mods_winit: ModifiersState::empty(),
+            hid_mod_mask: 0,
+            size: PhysicalSize::new(800, 600),
+            exiting: false,
+        }
+    }
+
+    #[inline]
+    fn send(&self, cmd: AppCmd) {
+        let _ = self.cmd_tx.try_send(cmd); // never block the window thread
+    }
+
+    fn set_button(&mut self, button: winit::event::MouseButton, pressed: bool) {
+        let bit = match button {
+            winit::event::MouseButton::Left => 0,
+            winit::event::MouseButton::Middle => 1,
+            winit::event::MouseButton::Right => 2,
+            _ => return,
+        };
+        if pressed {
+            self.mouse_buttons |= 1 << bit;
+        } else {
+            self.mouse_buttons &= !(1 << bit);
+        }
+    }
+
+    fn send_mouse(&self, dx: f64, dy: f64, wheel: i32) {
+        let clamp = |v: f64| v.clamp(i8::MIN as f64, i8::MAX as f64) as i8;
+        self.send(AppCmd::Mouse {
+            buttons: self.mouse_buttons,
+            dx: clamp(dx),
+            dy: clamp(dy),
+            wheel: wheel.clamp(i8::MIN as i32, i8::MAX as i32) as i8,
+        });
+    }
+
+    fn note_modifier_physical_transition(&mut self, usage: u8, down: bool) {
+        let bit = match usage {
+            0xE0 => 0,
+            0xE1 => 1,
+            0xE2 => 2,
+            0xE3 => 3,
+            0xE4 => 4,
+            0xE5 => 5,
+            0xE6 => 6,
+            0xE7 => 7,
+            _ => return,
+        };
+        if down {
+            self.hid_mod_mask |= 1 << bit;
+        } else {
+            self.hid_mod_mask &= !(1 << bit);
+        }
+    }
+
+    fn mods_to_hid_mask(mods: ModifiersState) -> u8 {
+        let mut m = 0u8;
+        if mods.control_key() {
+            m |= 1 << 0;
+        } // LCtrl
+        if mods.shift_key() {
+            m |= 1 << 1;
+        } // LShift
+        if mods.alt_key() {
+            m |= 1 << 2;
+        } // LAlt
+        if mods.super_key() {
+            m |= 1 << 3;
+        } // LGUI
+        m
+    }
+
+    fn reconcile_mods(&mut self, want: u8) {
+        const USAGE_FOR_BIT: [u8; 8] = [0xE0, 0xE1, 0xE2, 0xE3, 0xE4, 0xE5, 0xE6, 0xE7];
+        let have = self.hid_mod_mask;
+        let to_release = have & !want;
+        let to_press = want & !have;
+        for bit in 0..8 {
+            if (to_release & (1 << bit)) != 0 {
+                self.send(AppCmd::KeyUp(USAGE_FOR_BIT[bit]));
+            }
+        }
+        for bit in 0..8 {
+            if (to_press & (1 << bit)) != 0 {
+                self.send(AppCmd::KeyDown(USAGE_FOR_BIT[bit]));
+            }
+        }
+        self.hid_mod_mask = want;
+    }
+
+    fn draw_once_black(&mut self) {
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+
+        // Create context/surface as locals so we don't store borrows.
+        // Context<D>::new takes any D: HasDisplayHandle (e.g. &Window). :contentReference[oaicite:0]{index=0}
+        let ctx = match SbContext::new(window) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("softbuffer context error: {e}");
+                return;
+            }
+        };
+
+        // Surface<D,W>::new(&Context<D>, W) with W: HasWindowHandle (e.g. &Window). :contentReference[oaicite:1]{index=1}
+        let mut surf = match SbSurface::new(&ctx, window) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("softbuffer surface error: {e}");
+                return;
+            }
+        };
+
+        // softbuffer::Surface::resize requires NonZeroU32 sizes. :contentReference[oaicite:2]{index=2}
+        let w = NonZeroU32::new(self.size.width.max(1)).unwrap();
+        let h = NonZeroU32::new(self.size.height.max(1)).unwrap();
+        if let Err(e) = surf.resize(w, h) {
+            eprintln!("softbuffer resize error: {e}");
+            return;
+        }
+
+        // Fill with opaque black (0xAARRGGBB) and present once.
+        if let Ok(mut buf) = surf.buffer_mut() {
+            buf.fill(0xFF00_0000);
+            if let Err(e) = buf.present() {
+                eprintln!("softbuffer present error: {e}");
+            }
+        }
+    }
+}
+
+impl ApplicationHandler for App {
+    fn resumed(&mut self, el: &winit::event_loop::ActiveEventLoop) {
+        if self.exiting {
+            return;
+        }
+
+        let win = el.create_window(Window::default_attributes()).unwrap();
+        self.size = win.inner_size();
+        self.window = Some(win);
+        // Ask for the first frame so Wayland maps the toplevel.
+        self.window.as_ref().unwrap().request_redraw();
+        eprintln!("[winit] resumed -> window created");
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+        _window_id: winit::window::WindowId,
+        event: WindowEvent,
+    ) {
+        eprintln!("[winit] {:?}", event);
+
+        match event {
+            WindowEvent::CloseRequested => {
+                eprintln!("[winit] CloseRequested -> exit()");
+                // Drop cmd_tx when App is dropped (after run_app returns)
+                self.exiting = true;
+                event_loop.exit();
+            }
+            WindowEvent::Destroyed => {
+                eprintln!("[winit] Destroyed -> exit()");
+                self.exiting = true;
+                event_loop.exit();
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                let usage = match &event.physical_key {
+                    PhysicalKey::Code(code) => keycode_to_hid(*code), // your mapping fn
+                    _ => None,
+                };
+                if let Some(u) = usage {
+                    let down = matches!(event.state, ElementState::Pressed);
+                    self.send(if down {
+                        AppCmd::KeyDown(u)
+                    } else {
+                        AppCmd::KeyUp(u)
+                    });
+                    self.note_modifier_physical_transition(u, down);
+                }
+            }
+            WindowEvent::ModifiersChanged(m) => {
+                self.mods_winit = m.state();
+                let want = App::mods_to_hid_mask(self.mods_winit);
+                self.reconcile_mods(want);
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                self.set_button(button, matches!(state, ElementState::Pressed));
+                self.send_mouse(0.0, 0.0, 0);
+            }
+            WindowEvent::CursorEntered { .. } => {
+                self.cursor_last = None;
+            }
+            WindowEvent::CursorLeft { .. } => {
+                self.cursor_last = None;
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                let (x, y) = (position.x, position.y);
+                if let Some((px, py)) = self.cursor_last.replace((x, y)) {
+                    self.send_mouse(x - px, y - py, 0);
+                } else {
+                    self.send_mouse(0.0, 0.0, 0);
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                const PX_PER_NOTCH: f64 = 120.0;
+                let mut notches = 0i32;
+                match delta {
+                    MouseScrollDelta::LineDelta(_, y) => {
+                        notches = y.round() as i32;
+                    }
+                    MouseScrollDelta::PixelDelta(p) => {
+                        self.wheel_px_accum += p.y;
+                        while self.wheel_px_accum.abs() >= PX_PER_NOTCH {
+                            if self.wheel_px_accum > 0.0 {
+                                notches += 1;
+                                self.wheel_px_accum -= PX_PER_NOTCH;
+                            } else {
+                                notches -= 1;
+                                self.wheel_px_accum += PX_PER_NOTCH;
+                            }
+                        }
+                    }
+                }
+                if notches != 0 {
+                    self.send_mouse(0.0, 0.0, notches);
+                }
+            }
+            WindowEvent::Focused(focused) => {
+                if !focused {
+                    // Clear modifiers when focus is lost
+                    self.reconcile_mods(0);
+                }
+                eprintln!("Focused = {focused}");
+            }
+            WindowEvent::Resized(sz) => {
+                self.size = sz;
+                if let Some(w) = self.window.as_ref() {
+                    w.request_redraw();
+                }
+            }
+            WindowEvent::RedrawRequested => {
+                self.draw_once_black(); // ← presents one frame
+            }
+            _ => {}
+        }
+    }
+}
+
+// Your mapping table (same as earlier)
+fn keycode_to_hid(code: KeyCode) -> Option<u8> {
+    use KeyCode::*;
+    Some(match code {
+        KeyA => 0x04,
+        KeyB => 0x05,
+        KeyC => 0x06,
+        KeyD => 0x07,
+        KeyE => 0x08,
+        KeyF => 0x09,
+        KeyG => 0x0A,
+        KeyH => 0x0B,
+        KeyI => 0x0C,
+        KeyJ => 0x0D,
+        KeyK => 0x0E,
+        KeyL => 0x0F,
+        KeyM => 0x10,
+        KeyN => 0x11,
+        KeyO => 0x12,
+        KeyP => 0x13,
+        KeyQ => 0x14,
+        KeyR => 0x15,
+        KeyS => 0x16,
+        KeyT => 0x17,
+        KeyU => 0x18,
+        KeyV => 0x19,
+        KeyW => 0x1A,
+        KeyX => 0x1B,
+        KeyY => 0x1C,
+        KeyZ => 0x1D,
+        Digit1 => 0x1E,
+        Digit2 => 0x1F,
+        Digit3 => 0x20,
+        Digit4 => 0x21,
+        Digit5 => 0x22,
+        Digit6 => 0x23,
+        Digit7 => 0x24,
+        Digit8 => 0x25,
+        Digit9 => 0x26,
+        Digit0 => 0x27,
+        Enter => 0x28,
+        Escape => 0x29,
+        Backspace => 0x2A,
+        Tab => 0x2B,
+        Space => 0x2C,
+        Minus => 0x2D,
+        Equal => 0x2E,
+        BracketLeft => 0x2F,
+        BracketRight => 0x30,
+        Backslash => 0x31,
+        IntlBackslash => 0x32,
+        Semicolon => 0x33,
+        Quote => 0x34,
+        Backquote => 0x35,
+        Comma => 0x36,
+        Period => 0x37,
+        Slash => 0x38,
+        CapsLock => 0x39,
+        F1 => 0x3A,
+        F2 => 0x3B,
+        F3 => 0x3C,
+        F4 => 0x3D,
+        F5 => 0x3E,
+        F6 => 0x3F,
+        F7 => 0x40,
+        F8 => 0x41,
+        F9 => 0x42,
+        F10 => 0x43,
+        F11 => 0x44,
+        F12 => 0x45,
+        PrintScreen => 0x46,
+        ScrollLock => 0x47,
+        Pause => 0x48,
+        Insert => 0x49,
+        Home => 0x4A,
+        PageUp => 0x4B,
+        Delete => 0x4C,
+        End => 0x4D,
+        PageDown => 0x4E,
+        ArrowRight => 0x4F,
+        ArrowLeft => 0x50,
+        ArrowDown => 0x51,
+        ArrowUp => 0x52,
+        NumLock => 0x53,
+        NumpadDivide => 0x54,
+        NumpadMultiply => 0x55,
+        NumpadSubtract => 0x56,
+        NumpadAdd => 0x57,
+        NumpadEnter => 0x58,
+        Numpad1 => 0x59,
+        Numpad2 => 0x5A,
+        Numpad3 => 0x5B,
+        Numpad4 => 0x5C,
+        Numpad5 => 0x5D,
+        Numpad6 => 0x5E,
+        Numpad7 => 0x5F,
+        Numpad8 => 0x60,
+        Numpad9 => 0x61,
+        Numpad0 => 0x62,
+        NumpadDecimal => 0x63,
+        ControlLeft => 0xE0,
+        ShiftLeft => 0xE1,
+        AltLeft => 0xE2,
+        SuperLeft => 0xE3,
+        ControlRight => 0xE4,
+        ShiftRight => 0xE5,
+        AltRight => 0xE6,
+        SuperRight => 0xE7,
+        _ => return None,
+    })
+}
+
+// ------------------- BLE owner task (your logic) -------------------
+
+async fn ble_owner_task(
+    mut cmd_rx: mpsc::Receiver<AppCmd>,
+    mut evt_rx: mpsc::Receiver<PeripheralEvent>,
+    evt_tx: mpsc::Sender<PeripheralEvent>,
+) -> anyhow::Result<()> {
+    let (hid_service, mouse_in_uuid, keybd_in_uuid) = build_hid_services();
+
     let bas_service = Service {
         uuid: Uuid::from_short(UUID_BAS_SERVICE),
         primary: true,
@@ -82,6 +461,7 @@ async fn main() -> anyhow::Result<()> {
             ..Default::default()
         }],
     };
+
     let dis_service = Service {
         uuid: Uuid::from_short(UUID_DIS_SERVICE),
         primary: true,
@@ -90,20 +470,21 @@ async fn main() -> anyhow::Result<()> {
                 uuid: Uuid::from_short(UUID_MFG_NAME),
                 properties: vec![CharacteristicProperty::Read],
                 permissions: vec![AttributePermission::Readable],
-                value: Some(b"BluePointer Labs".to_vec()),
+                value: Some(PERIPHERAL_NAME.as_bytes().to_vec()),
                 ..Default::default()
             },
             Characteristic {
                 uuid: Uuid::from_short(UUID_MODEL_NUM),
                 properties: vec![CharacteristicProperty::Read],
                 permissions: vec![AttributePermission::Readable],
-                value: Some(b"BluePointer-1".to_vec()),
+                value: Some(PERIPHERAL_NAME.as_bytes().to_vec()),
                 ..Default::default()
             },
         ],
     };
 
-    // ---------- BLE owner task ----------
+    // Peripheral setup
+    // Create the Peripheral in this task so ownership is localized
     let mut peripheral = Peripheral::new(evt_tx).await?;
     while !peripheral.is_powered().await? {}
     peripheral.add_service(&hid_service).await?;
@@ -111,43 +492,33 @@ async fn main() -> anyhow::Result<()> {
     peripheral.add_service(&dis_service).await?;
     peripheral
         .start_advertising(
-            "BluePointer",
+            PERIPHERAL_NAME,
             &[
                 Uuid::from_short(UUID_HID_SERVICE),
                 Uuid::from_short(UUID_BAS_SERVICE),
                 Uuid::from_short(UUID_DIS_SERVICE),
             ],
-            Some(0x03C0),
+            Some(PERIPHERAL_APPEARANCE),
         )
         .await?;
 
-    // Keyboard state for 6KRO report (modifiers + 6 keys)
+    // Keyboard 6KRO state
     let mut modifiers: u8 = 0;
     let mut pressed: BTreeSet<u8> = BTreeSet::new();
-    let mut report_notify_enabled = false;
+    let mut notify = false;
 
-    // ---------- Producers ----------
-    // 1) stdin (crossterm) demo input
-    let stdin_tx = cmd_tx.clone();
-    task::spawn(async move { read_stdin(stdin_tx).await });
-
-    // 2) evdev system devices (mouse + keyboard)
-    let evdev_tx = cmd_tx.clone();
-    task::spawn(async move { read_evdev(evdev_tx).await });
-
-    // ---------- Main loop: drive BLE with both BLE events and AppCmd ----------
+    // Drive BLE with both BLE events and UI commands
     loop {
         select! {
-            // BLE stack → us
             ev = evt_rx.recv() => {
                 match ev {
                     Some(PeripheralEvent::StateUpdate{ is_powered }) => {
                         println!("Adapter powered: {is_powered}");
                     }
                     Some(PeripheralEvent::CharacteristicSubscriptionUpdate { request, subscribed }) => {
-                        if request.characteristic == report_char_uuid {
-                            report_notify_enabled = subscribed;
-                            println!("Report notify: {subscribed}");
+                        if request.characteristic == mouse_in_uuid {
+                            notify = subscribed;
+                            println!("Report notify MOUSE: {subscribed}");
                         } else {
                             println!("Other subscription: {subscribed} for {request:?}");
                         }
@@ -166,97 +537,155 @@ async fn main() -> anyhow::Result<()> {
                     None => break,
                 }
             }
-
-            // App-produced input → send HID reports
             cmd = cmd_rx.recv() => {
+                println!("Received command: {cmd:?}");
                 match cmd {
-                    Some(AppCmd::Mouse { buttons, dx, dy, wheel }) if report_notify_enabled => {
-                        let pkt = vec![RID_MOUSE, buttons, dx as u8, dy as u8, wheel as u8];
+                    Some(AppCmd::Mouse { buttons, dx, dy, wheel }) if notify => {
+                        let pkt = build_mouse_report(buttons, dx, dy, wheel);
                         println!("TX mouse: btn={buttons:#04b} dx={dx} dy={dy} wheel={wheel}");
-                        peripheral.update_characteristic(report_char_uuid, pkt.into()).await?;
+                        peripheral.update_characteristic(mouse_in_uuid, pkt.into()).await?;
                     }
-                    Some(AppCmd::KeyDown(usage)) if report_notify_enabled => {
+                    Some(AppCmd::KeyDown(usage)) if notify => {
                         if let Some(m) = keyboard_usage_to_modifier(usage) {
                             modifiers |= m;
                         } else {
                             pressed.insert(usage);
-                            while pressed.len() > 6 { // keep 6KRO
+                            while pressed.len() > 6 {
                                 let first = *pressed.iter().next().unwrap();
                                 pressed.remove(&first);
                             }
                         }
-                        println!("TX keybd: mods={modifiers:#010b} keys={:?}", pressed);
                         let pkt = build_keyboard_report(modifiers, &pressed);
-                        peripheral.update_characteristic(report_char_uuid, pkt.into()).await?;
+                        println!("TX keybd DOWN: mods={:#010b} keys={:?}", modifiers, pressed);
+                        peripheral.update_characteristic(keybd_in_uuid, pkt.into()).await?;
                     }
-                    Some(AppCmd::KeyUp(usage)) if report_notify_enabled => {
+                    Some(AppCmd::KeyUp(usage)) if notify => {
                         if let Some(m) = keyboard_usage_to_modifier(usage) {
                             modifiers &= !m;
                         } else {
                             pressed.remove(&usage);
                         }
                         let pkt = build_keyboard_report(modifiers, &pressed);
-                        peripheral.update_characteristic(report_char_uuid, pkt.into()).await?;
+                        println!("TX keybd UP: mods={:#010b} keys={:?}", modifiers, pressed);
+                        peripheral.update_characteristic(keybd_in_uuid, pkt.into()).await?;
                     }
                     Some(AppCmd::Battery(level)) => {
                         peripheral.update_characteristic(Uuid::from_short(UUID_BATTERY_LEVEL), vec![level].into()).await?;
                         println!("Battery set to {}%", level);
                     }
-                    Some(_) | None => {}
+                    Some(_) => {}
+                    None => break, // UI dropped the sender (window closed) → exit cleanly
                 }
             }
         }
     }
 
     peripheral.stop_advertising().await?;
+    Ok(())
+}
+
+// ------------------- main: spawn BLE, run winit -------------------
+
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> anyhow::Result<()> {
+    // Channels
+    let (cmd_tx, cmd_rx) = mpsc::channel::<AppCmd>(512);
+    let (evt_tx, evt_rx) = mpsc::channel::<PeripheralEvent>(512);
+
+    // Spawn BLE owner on Tokio. Move the receivers and evt_tx in as needed by your Peripheral::new(evt_tx).
+    let ble_handle = tokio::spawn(async move {
+        // Inside task, construct Peripheral with evt_tx (moved), then run loop with cmd_rx, evt_rx
+        // Because we need evt_tx for Peripheral::new, pass it through with evt_rx:
+        // If your Peripheral::new(evt_tx) signature requires evt_tx at construction,
+        // move evt_tx in here and keep evt_rx in this task as we do.
+        // For demonstration, assume Peripheral::new(evt_tx) is called inside ble_owner_task:
+        if let Err(e) = ble_owner_task(cmd_rx, evt_rx, evt_tx).await {
+            eprintln!("BLE task error: {e:#}");
+        }
+    });
+
+    // Build & run winit app on the main thread (blocking)
+    let mut app = App::new(cmd_tx.clone());
+    let event_loop = event_loop::EventLoop::new()?;
+    eprintln!("about to run_app");
+    event_loop.run_app(&mut app)?;
+
+    // After the window exits: drop the last sender to close the BLE task
+    drop(cmd_tx);
+
+    // Wait for BLE to finish cleanup
+    let _ = ble_handle.await;
 
     Ok(())
 }
 
-/// Build HID service with:
-/// - Report Map (mouse RID=1, keyboard RID=2)
-/// - Report (Input) x2 (mouse & keyboard) with proper Report Reference
-fn build_hid_services() -> (Service, Uuid) {
-    // --- Report Map combining mouse + keyboard ---
-    let mut report_map: Vec<u8> = Vec::new();
-
-    // Mouse (RID 1)
-    report_map.extend_from_slice(&[
-        0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x85, RID_MOUSE, 0x09, 0x01, 0xA1, 0x00, 0x05, 0x09,
-        0x19, 0x01, 0x29, 0x03, 0x15, 0x00, 0x25, 0x01, 0x95, 0x03, 0x75, 0x01, 0x81, 0x02, 0x95,
-        0x01, 0x75, 0x05, 0x81, 0x03, 0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x38, 0x15, 0x81,
-        0x25, 0x7F, 0x75, 0x08, 0x95, 0x03, 0x81, 0x06, 0xC0, 0xC0,
-    ]);
-
-    // Keyboard (RID 2): 8-byte report (mods, reserved, 6 keycodes) + LED OUT report
-    report_map.extend_from_slice(&[
-        0x05, 0x01, // Generic Desktop
-        0x09, 0x06, // Keyboard
+// --- new: return two UUIDs (mouse_in, keybd_in) ---
+fn build_hid_services() -> (Service, Uuid, Uuid) {
+    let report_map: Vec<u8> = vec![
+        // ----- Mouse, Report ID 1 -----
+        0x05, 0x01, // Usage Page (Generic Desktop)
+        0x09, 0x02, // Usage (Mouse)
         0xA1, 0x01, // Collection (Application)
-        0x85, RID_KEYBD, 0x05, 0x07, // Usage Page (Keyboard/Keypad)
-        // Modifiers (8 bits)
-        0x19, 0xE0, 0x29, 0xE7, // Usage Min/Max (LeftCtrl..RightGUI)
-        0x15, 0x00, 0x25, 0x01, // Logical 0..1
-        0x75, 0x01, 0x95, 0x08, 0x81, 0x02, // Input (Data,Var,Abs)
-        // Reserved
-        0x75, 0x08, 0x95, 0x01, 0x81, 0x03, // Input (Const)
-        // 6 keycodes
-        0x15, 0x00, 0x25, 0x65, // 0..101 (enough for common keys)
-        0x19, 0x00, 0x29, 0x65, 0x75, 0x08, 0x95, 0x06, 0x81, 0x00, // Input (Data,Array)
-        // --- Keyboard LEDs (OUT report bits) ---
-        0x05, 0x08, // Usage Page (LEDs)
-        0x19, 0x01, // Usage Minimum (Num Lock)
-        0x29, 0x05, // Usage Maximum (Kana)
-        0x95, 0x05, // Report Count (5)
-        0x75, 0x01, // Report Size (1)
-        0x91, 0x02, // Output (Data,Var,Abs)
-        0x95, 0x01, // Report Count (1)
-        0x75, 0x03, // Report Size (3) ; padding
-        0x91, 0x03, // Output (Const,Var,Abs)
+        0x85, RID_MOUSE, //   Report ID (1)
+        0x09, 0x01, //   Usage (Pointer)
+        0xA1, 0x00, //   Collection (Physical)
+        0x05, 0x09, //     Usage Page (Buttons)
+        0x19, 0x01, //     Usage Minimum (Button 1)
+        0x29, 0x03, //     Usage Maximum (Button 3)
+        0x15, 0x00, //     Logical Minimum (0)
+        0x25, 0x01, //     Logical Maximum (1)
+        0x95, 0x03, //     Report Count (3)
+        0x75, 0x01, //     Report Size (1)
+        0x81, 0x02, //     Input (Data,Var,Abs)
+        0x95, 0x01, //     Report Count (1)
+        0x75, 0x05, //     Report Size (5)
+        0x81, 0x03, //     Input (Const,Var,Abs)
+        0x05, 0x01, //     Usage Page (Generic Desktop)
+        0x09, 0x30, //     Usage (X)
+        0x09, 0x31, //     Usage (Y)
+        0x09, 0x38, //     Usage (Wheel)
+        0x15, 0x81, //     Logical Minimum (-127)
+        0x25, 0x7F, //     Logical Maximum (127)
+        0x75, 0x08, //     Report Size (8)
+        0x95, 0x03, //     Report Count (3)
+        0x81, 0x06, //     Input (Data,Var,Rel)
+        0xC0, //   End Collection
         0xC0, // End Collection
-    ]);
+        // ----- Keyboard, Report ID 2 -----
+        0x05, 0x01, // Usage Page (Generic Desktop)
+        0x09, 0x06, // Usage (Keyboard)
+        0xA1, 0x01, // Collection (Application)
+        0x85, RID_KEYBD, //   Report ID (2)
+        0x05, 0x07, //   Usage Page (Keyboard/Keypad)
+        // Modifier byte
+        0x19, 0xE0, //   Usage Minimum (Left Ctrl)
+        0x29, 0xE7, //   Usage Maximum (Right GUI)
+        0x15, 0x00, //   Logical Minimum (0)
+        0x25, 0x01, //   Logical Maximum (1)
+        0x75, 0x01, //   Report Size (1)
+        0x95, 0x08, //   Report Count (8)
+        0x81, 0x02, //   Input (Data,Var,Abs)
+        // Reserved byte
+        0x75, 0x08, //   Report Size (8)
+        0x95, 0x01, //   Report Count (1)
+        0x81, 0x03, //   Input (Const,Var,Abs)
+        // 6 Keycode array
+        0x15, 0x00, //   Logical Minimum (0)
+        0x25, 0x65, //   Logical Maximum (101)
+        0x19, 0x00, //   Usage Minimum (0)
+        0x29, 0x65, //   Usage Maximum (101)
+        0x75, 0x08, //   Report Size (8)
+        0x95, 0x06, //   Report Count (6)
+        0x81, 0x00, //   Input (Data,Array)
+        0xC0, // End Collection
+    ];
 
-    let report_char_uuid = Uuid::from_short(UUID_HID_REPORT);
+    let uuid_report_map = Uuid::from_short(UUID_HID_REPORT_MAP);
+    let uuid_report = Uuid::from_short(UUID_HID_REPORT);
+
+    // Distinct characteristic UUIDs (same 16-bit type) so you can address each:
+    let mouse_in_uuid = uuid_report; // 0x2A4D
+    let keybd_in_uuid = uuid_report;
 
     let hid_service = Service {
         uuid: Uuid::from_short(UUID_HID_SERVICE),
@@ -273,7 +702,6 @@ fn build_hid_services() -> (Service, Uuid) {
                 uuid: Uuid::from_short(UUID_HID_CONTROL_POINT),
                 properties: vec![CharacteristicProperty::Write],
                 permissions: vec![AttributePermission::Writeable],
-                value: None,
                 ..Default::default()
             },
             Characteristic {
@@ -287,31 +715,31 @@ fn build_hid_services() -> (Service, Uuid) {
                 ..Default::default()
             },
             Characteristic {
-                uuid: Uuid::from_short(UUID_HID_REPORT_MAP),
+                uuid: uuid_report_map,
                 properties: vec![CharacteristicProperty::Read],
                 permissions: vec![AttributePermission::Readable],
                 value: Some(report_map),
                 ..Default::default()
             },
+            // --- Mouse Input Report (RID 1) ---
             Characteristic {
-                uuid: report_char_uuid,
+                uuid: mouse_in_uuid,
                 properties: vec![CharacteristicProperty::Read, CharacteristicProperty::Notify],
                 permissions: vec![AttributePermission::Readable],
-                value: None,
-                // descriptor value can be RID_MOUSE or RID_KEYBD; the payload's Report ID is what matters
+                // Many stacks add CCCD automatically for Notify; descriptor below is the Report Reference:
                 descriptors: vec![Descriptor {
                     uuid: Uuid::from_short(UUID_REPORT_REF_DESC),
+                    // [Report ID, Report Type(Input=1, Output=2, Feature=3)]
                     value: Some(vec![RID_MOUSE, 0x01]),
                     ..Default::default()
                 }],
                 ..Default::default()
             },
+            // --- Keyboard Input Report (RID 2) ---
             Characteristic {
-                uuid: report_char_uuid,
+                uuid: keybd_in_uuid,
                 properties: vec![CharacteristicProperty::Read, CharacteristicProperty::Notify],
                 permissions: vec![AttributePermission::Readable],
-                value: None,
-                // descriptor value can be RID_MOUSE or RID_KEYBD; the payload's Report ID is what matters
                 descriptors: vec![Descriptor {
                     uuid: Uuid::from_short(UUID_REPORT_REF_DESC),
                     value: Some(vec![RID_KEYBD, 0x01]),
@@ -322,18 +750,25 @@ fn build_hid_services() -> (Service, Uuid) {
         ],
     };
 
-    (hid_service, report_char_uuid)
+    (hid_service, mouse_in_uuid, keybd_in_uuid)
 }
 
-/// Build an 8-byte keyboard input report prefixed with Report ID
+/// 5-byte mouse: [RID, buttons, dx, dy, wheel]
+fn build_mouse_report(buttons: u8, dx: i8, dy: i8, wheel: i8) -> Vec<u8> {
+    vec![RID_MOUSE, buttons, dx as u8, dy as u8, wheel as u8]
+}
+
+/// 9-byte keyboard: [RID, mods, reserved, k0..k5]
 fn build_keyboard_report(mods: u8, pressed: &BTreeSet<u8>) -> Vec<u8> {
-    let mut out = vec![RID_KEYBD, mods, 0x00 /* reserved */];
-    // up to 6 keys
+    let mut out = Vec::with_capacity(1 + 8);
+    out.push(RID_KEYBD);
+    out.push(mods);
+    out.push(0x00); // reserved
     for &k in pressed.iter().take(6) {
         out.push(k);
     }
     while out.len() < 1 + 1 + 1 + 6 {
-        out.push(0); // fill remaining slots
+        out.push(0);
     }
     out
 }
@@ -351,379 +786,4 @@ fn keyboard_usage_to_modifier(usage: u8) -> Option<u8> {
         0xE7 => Some(1 << 7), // RGUI
         _ => None,
     }
-}
-
-/// =====================
-/// INPUT PRODUCERS
-/// =====================
-
-/// 1) stdin producer (crossterm) — good for quick testing without evdev permissions.
-/// - Press `q` to quit.
-/// - Arrow keys move the mouse.
-/// - `a..z` send keyboard presses.
-/// - Hold Shift/Ctrl/Alt/GUI to test modifiers.
-/// - Optional: enable mouse capture to translate terminal mouse drags → HID mouse.
-async fn read_stdin(tx: mpsc::Sender<AppCmd>) -> anyhow::Result<()> {
-    use crossterm::{
-        ExecutableCommand,
-        event::{
-            self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind,
-            KeyModifiers, MouseEventKind,
-        },
-        terminal,
-    };
-
-    let _ = std::io::stdout().execute(terminal::EnterAlternateScreen);
-    let _ = enable_raw_mode();
-    let _ = execute!(std::io::stdout(), EnableMouseCapture)?;
-
-    println!("stdin: press 'q' to quit, arrows move mouse, letters send keypresses");
-
-    loop {
-        // non-blocking poll so we can periodically yield
-        if event::poll(Duration::from_millis(25)).unwrap_or(false) {
-            match event::read() {
-                Ok(Event::Key(k)) => {
-                    // key press / release
-                    let is_press = matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat);
-                    // modifiers
-                    let mut mods = Vec::new();
-                    if k.modifiers.contains(KeyModifiers::CONTROL) {
-                        mods.extend([0xE0]);
-                    } // LCtrl
-                    if k.modifiers.contains(KeyModifiers::SHIFT) {
-                        mods.extend([0xE1]);
-                    } // LShift
-                    if k.modifiers.contains(KeyModifiers::ALT) {
-                        mods.extend([0xE2]);
-                    } // LAlt
-                    if k.modifiers.contains(KeyModifiers::SUPER) {
-                        mods.extend([0xE3]);
-                    } // LGUI
-
-                    for m in mods {
-                        let _ = if is_press {
-                            tx.send(AppCmd::KeyDown(m)).await
-                        } else {
-                            tx.send(AppCmd::KeyUp(m)).await
-                        };
-                    }
-
-                    // basic alphanumerics + ESC + ENTER + SPACE
-                    if let Some(usage) = keycode_to_hid_usage(&k.code) {
-                        let _ = if is_press {
-                            tx.send(AppCmd::KeyDown(usage)).await
-                        } else {
-                            tx.send(AppCmd::KeyUp(usage)).await
-                        };
-                    }
-
-                    if k.code == KeyCode::Char('q') && is_press && k.modifiers.is_empty() {
-                        break;
-                    }
-                }
-                Ok(Event::Mouse(m)) => {
-                    match m.kind {
-                        MouseEventKind::Down(btn) | MouseEventKind::Up(btn) => {
-                            // simple: map left/middle/right only
-                            let mask = match btn {
-                                crossterm::event::MouseButton::Left => 1 << 0,
-                                crossterm::event::MouseButton::Middle => 1 << 2,
-                                crossterm::event::MouseButton::Right => 1 << 1,
-                            };
-                            // we can’t read current button state from crossterm easily; just emit press OR release deltas
-                            let _ = tx
-                                .send(AppCmd::Mouse {
-                                    buttons: mask,
-                                    dx: 0,
-                                    dy: 0,
-                                    wheel: 0,
-                                })
-                                .await;
-                        }
-                        MouseEventKind::Drag(_) | MouseEventKind::Moved => {
-                            // terminal only gives absolute cell coords; approximate small deltas
-                            let _ = tx
-                                .send(AppCmd::Mouse {
-                                    buttons: 0,
-                                    dx: 1,
-                                    dy: 1,
-                                    wheel: 0,
-                                })
-                                .await;
-                        }
-                        MouseEventKind::ScrollDown => {
-                            let _ = tx
-                                .send(AppCmd::Mouse {
-                                    buttons: 0,
-                                    dx: 0,
-                                    dy: 0,
-                                    wheel: -1,
-                                })
-                                .await;
-                        }
-                        MouseEventKind::ScrollUp => {
-                            let _ = tx
-                                .send(AppCmd::Mouse {
-                                    buttons: 0,
-                                    dx: 0,
-                                    dy: 0,
-                                    wheel: 1,
-                                })
-                                .await;
-                        }
-                        _ => {}
-                    }
-                }
-                _ => {}
-            }
-        } else {
-            sleep(Duration::from_millis(5)).await;
-        }
-    }
-
-    execute!(std::io::stdout(), DisableMouseCapture)?;
-    disable_raw_mode()?;
-
-    Ok(())
-}
-
-/// Minimal mapping for demo (extend as needed).
-fn keycode_to_hid_usage(code: &crossterm::event::KeyCode) -> Option<u8> {
-    use crossterm::event::KeyCode::*;
-    Some(match code {
-        Char('a') => 0x04,
-        Char('b') => 0x05,
-        Char('c') => 0x06,
-        Char('d') => 0x07,
-        Char('e') => 0x08,
-        Char('f') => 0x09,
-        Char('g') => 0x0A,
-        Char('h') => 0x0B,
-        Char('i') => 0x0C,
-        Char('j') => 0x0D,
-        Char('k') => 0x0E,
-        Char('l') => 0x0F,
-        Char('m') => 0x10,
-        Char('n') => 0x11,
-        Char('o') => 0x12,
-        Char('p') => 0x13,
-        Char('q') => 0x14,
-        Char('r') => 0x15,
-        Char('s') => 0x16,
-        Char('t') => 0x17,
-        Char('u') => 0x18,
-        Char('v') => 0x19,
-        Char('w') => 0x1A,
-        Char('x') => 0x1B,
-        Char('y') => 0x1C,
-        Char('z') => 0x1D,
-        Char('1') => 0x1E,
-        Char('2') => 0x1F,
-        Char('3') => 0x20,
-        Char('4') => 0x21,
-        Char('5') => 0x22,
-        Char('6') => 0x23,
-        Char('7') => 0x24,
-        Char('8') => 0x25,
-        Char('9') => 0x26,
-        Char('0') => 0x27,
-        Enter => 0x28,
-        Esc => 0x29,
-        Backspace => 0x2A,
-        Tab => 0x2B,
-        Space => 0x2C,
-        Left => 0x50,
-        Right => 0x4F,
-        Up => 0x52,
-        Down => 0x51,
-        _ => return None,
-    })
-}
-
-/// 2) evdev producer (system-wide devices)
-async fn read_evdev(tx: mpsc::Sender<AppCmd>) {
-    // You’ll need read access to /dev/input/event* (run as root or udev rule).
-    // We attach to the first keyboard & mouse we find. Extend to handle hotplug/multiple devices.
-    let mut kb: Option<evdev::Device> = None;
-    let mut ms: Option<evdev::Device> = None;
-
-    // scan devices
-    for (path, mut d) in evdev::enumerate() {
-        let name = d.name().unwrap_or("unknown").to_string();
-        if d.supported_keys()
-            .map(|k| k.iter().len() > 0)
-            .unwrap_or(false)
-            && kb.is_none()
-        {
-            kb = Some(d);
-            println!("Using keyboard: {name} @ {}", path.display());
-        } else if d.supported_relative_axes().is_some() && ms.is_none() {
-            ms = Some(d);
-            println!("Using mouse: {name} @ {}", path.display());
-        }
-    }
-
-    // Spawn blocking readers (evdev is blocking)
-    if let Some(mut dev) = kb {
-        let tx2 = tx.clone();
-        task::spawn_blocking(move || {
-            loop {
-                for ev in dev.fetch_events().unwrap() {
-                    if ev.event_type() == EventType::KEY {
-                        let code = evdev::KeyCode::new(ev.code());
-                        let usage = evdev_key_to_hid(code);
-                        if let Some(u) = usage {
-                            let cmd = if ev.value() != 0 {
-                                AppCmd::KeyDown(u)
-                            } else {
-                                AppCmd::KeyUp(u)
-                            };
-                            if tx2.blocking_send(cmd).is_err() {
-                                return;
-                            }
-                        }
-                    }
-                }
-            }
-        });
-    }
-    if let Some(mut dev) = ms {
-        task::spawn_blocking(move || {
-            let mut buttons: u8 = 0;
-            loop {
-                let mut dx = 0i32;
-                let mut dy = 0i32;
-                let mut wheel = 0i32;
-                for ev in dev.fetch_events().unwrap() {
-                    match ev.event_type() {
-                        EventType::RELATIVE => match RelativeAxisCode(ev.code()) {
-                            RelativeAxisCode::REL_X => dx += ev.value(),
-                            RelativeAxisCode::REL_Y => dy += ev.value(),
-                            RelativeAxisCode::REL_WHEEL => wheel += ev.value(),
-                            _ => {}
-                        },
-                        EventType::KEY => {
-                            // map BTN_LEFT/RIGHT/MIDDLE
-                            let code = KeyCode::new(ev.code());
-                            let mask = match code {
-                                KeyCode::BTN_LEFT => 1 << 0,
-                                KeyCode::BTN_RIGHT => 1 << 1,
-                                KeyCode::BTN_MIDDLE => 1 << 2,
-                                _ => 0,
-                            };
-                            if mask != 0 {
-                                if ev.value() != 0 {
-                                    buttons |= mask;
-                                } else {
-                                    buttons &= !mask;
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                if dx != 0 || dy != 0 || wheel != 0 {
-                    let _ = tx.blocking_send(AppCmd::Mouse {
-                        buttons,
-                        dx: dx.clamp(-127, 127) as i8,
-                        dy: dy.clamp(-127, 127) as i8,
-                        wheel: wheel.clamp(-127, 127) as i8,
-                    });
-                }
-            }
-        });
-    }
-}
-
-/// Very small evdev->HID usage mapping (extend as needed)
-fn evdev_key_to_hid(k: evdev::KeyCode) -> Option<u8> {
-    Some(match k {
-        KEY_A => 0x04,
-        KEY_B => 0x05,
-        KEY_C => 0x06,
-        KEY_D => 0x07,
-        KEY_E => 0x08,
-        KEY_F => 0x09,
-        KEY_G => 0x0A,
-        KEY_H => 0x0B,
-        KEY_I => 0x0C,
-        KEY_J => 0x0D,
-        KEY_K => 0x0E,
-        KEY_L => 0x0F,
-        KEY_M => 0x10,
-        KEY_N => 0x11,
-        KEY_O => 0x12,
-        KEY_P => 0x13,
-        KEY_Q => 0x14,
-        KEY_R => 0x15,
-        KEY_S => 0x16,
-        KEY_T => 0x17,
-        KEY_U => 0x18,
-        KEY_V => 0x19,
-        KEY_W => 0x1A,
-        KEY_X => 0x1B,
-        KEY_Y => 0x1C,
-        KEY_Z => 0x1D,
-        KEY_1 => 0x1E,
-        KEY_2 => 0x1F,
-        KEY_3 => 0x20,
-        KEY_4 => 0x21,
-        KEY_5 => 0x22,
-        KEY_6 => 0x23,
-        KEY_7 => 0x24,
-        KEY_8 => 0x25,
-        KEY_9 => 0x26,
-        KEY_0 => 0x27,
-        KEY_ENTER => 0x28,
-        KEY_ESC => 0x29,
-        KEY_BACKSPACE => 0x2A,
-        KEY_TAB => 0x2B,
-        KEY_SPACE => 0x2C,
-        KEY_MINUS => 0x2D,
-        KEY_EQUAL => 0x2E,
-        KEY_LEFTBRACE => 0x2F,
-        KEY_RIGHTBRACE => 0x30,
-        KEY_BACKSLASH => 0x31,
-        KEY_SEMICOLON => 0x33,
-        KEY_APOSTROPHE => 0x34,
-        KEY_GRAVE => 0x35,
-        KEY_COMMA => 0x36,
-        KEY_DOT => 0x37,
-        KEY_SLASH => 0x38,
-        KEY_CAPSLOCK => 0x39,
-        KEY_F1 => 0x3A,
-        KEY_F2 => 0x3B,
-        KEY_F3 => 0x3C,
-        KEY_F4 => 0x3D,
-        KEY_F5 => 0x3E,
-        KEY_F6 => 0x3F,
-        KEY_F7 => 0x40,
-        KEY_F8 => 0x41,
-        KEY_F9 => 0x42,
-        KEY_F10 => 0x43,
-        KEY_F11 => 0x44,
-        KEY_F12 => 0x45,
-        KEY_SYSRQ => 0x46,
-        KEY_SCROLLLOCK => 0x47,
-        KEY_PAUSE => 0x48,
-        KEY_INSERT => 0x49,
-        KEY_HOME => 0x4A,
-        KEY_PAGEUP => 0x4B,
-        KEY_DELETE => 0x4C,
-        KEY_END => 0x4D,
-        KEY_PAGEDOWN => 0x4E,
-        KEY_RIGHT => 0x4F,
-        KEY_LEFT => 0x50,
-        KEY_DOWN => 0x51,
-        KEY_UP => 0x52,
-        KEY_LEFTCTRL => 0xE0,
-        KEY_LEFTSHIFT => 0xE1,
-        KEY_LEFTALT => 0xE2,
-        KEY_LEFTMETA => 0xE3,
-        KEY_RIGHTCTRL => 0xE4,
-        KEY_RIGHTSHIFT => 0xE5,
-        KEY_RIGHTALT => 0xE6,
-        KEY_RIGHTMETA => 0xE7,
-    })
 }
