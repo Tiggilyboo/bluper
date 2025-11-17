@@ -1,11 +1,11 @@
+mod ble;
 mod consts;
 pub mod hid;
-mod ui;
-mod ble;
 mod host_power;
+mod ui;
 
-use tokio::sync::mpsc;
 use ble_peripheral_rust::gatt::peripheral_event::PeripheralEvent;
+use tokio::sync::mpsc;
 use winit::event_loop;
 
 use clap::Parser;
@@ -15,16 +15,12 @@ use crate::ble::ble_owner_task;
 use crate::ui::{App, AppCmd};
 
 #[derive(Debug, Parser)]
-#[command(name = "bluper", version, about = "BLE HID K+M peripheral")] 
+#[command(name = "bluper", version, about = "BLE HID K+M peripheral")]
 struct Cli {
-    #[arg(long, default_value = "Bluper")] 
+    #[arg(long, default_value = "Bluper")]
     name: String,
-    #[arg(long, value_parser = clap::value_parser!(u16))]
-    appearance: Option<u16>,
-    #[arg(long, default_value = "info")] 
+    #[arg(long, default_value = "info")]
     log_level: String,
-    #[arg(long)]
-    headless: bool,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -48,7 +44,9 @@ async fn main() -> anyhow::Result<()> {
                 tick.tick().await;
                 if let Some(p) = crate::host_power::get_battery_percent() {
                     if last_sent != Some(p) {
-                        if cmd.send(AppCmd::Battery(p)).await.is_err() { break; }
+                        if cmd.send(AppCmd::Battery(p)).await.is_err() {
+                            break;
+                        }
                         last_sent = Some(p);
                         tracing::debug!(%p, "Battery polled");
                     }
@@ -58,19 +56,13 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let name = cli.name.clone();
-    let appearance = cli.appearance.or(Some(consts::PERIPHERAL_APPEARANCE));
+    let appearance = Some(consts::PERIPHERAL_APPEARANCE);
 
     let ble_handle = tokio::spawn(async move {
         if let Err(e) = ble_owner_task(cmd_rx, evt_rx, evt_tx, name, appearance).await {
             tracing::error!(error = %format!("{e:#}"), "BLE task error");
         }
     });
-
-    if cli.headless {
-        // Run BLE only; keep process alive until BLE task ends
-        let _ = ble_handle.await;
-        return Ok(());
-    }
 
     let mut app = App::new(cmd_tx.clone());
     let event_loop = event_loop::EventLoop::new()?;

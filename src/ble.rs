@@ -1,5 +1,4 @@
 use std::collections::BTreeSet;
-
 use tokio::{select, sync::mpsc};
 use uuid::Uuid;
 
@@ -202,8 +201,9 @@ pub async fn ble_owner_task(
                             tracing::info!(%level, "Battery set");
                         }
                     }
-                    Some(_) => {}
+                    Some(AppCmd::Exit) => break,
                     None => break,
+                    Some(_) => {}
                 }
             }
         }

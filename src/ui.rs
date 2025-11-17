@@ -16,6 +16,7 @@ use crate::hid::keycode_to_hid;
 
 #[derive(Debug)]
 pub enum AppCmd {
+    Exit,
     Mouse {
         buttons: u8,
         dx: i8,
@@ -173,6 +174,7 @@ impl ApplicationHandler for App {
         tracing::trace!(?event, "winit event");
         match event {
             WindowEvent::CloseRequested | WindowEvent::Destroyed => {
+                self.send(AppCmd::Exit);
                 self.exiting = true;
                 // Drop softbuffer resources explicitly
                 self.sb_surface = None;
