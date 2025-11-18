@@ -32,10 +32,10 @@ pub async fn ble_owner_task(
             uuid: Uuid::from_short(UUID_BATTERY_LEVEL),
             properties: vec![
                 ble_peripheral_rust::gatt::properties::CharacteristicProperty::Read,
-                ble_peripheral_rust::gatt::properties::CharacteristicProperty::Notify,
+                ble_peripheral_rust::gatt::properties::CharacteristicProperty::NotifyEncryptionRequired,
             ],
-            permissions: vec![ble_peripheral_rust::gatt::properties::AttributePermission::Readable],
-            value: Some(vec![95]),
+            permissions: vec![ble_peripheral_rust::gatt::properties::AttributePermission::ReadEncryptionRequired],
+            value: Some(vec![0]),
             ..Default::default()
         }],
     };

@@ -231,28 +231,34 @@ pub fn build_hid_service() -> (Service, Uuid) {
             Characteristic {
                 uuid: Uuid::from_short(UUID_HID_CONTROL_POINT),
                 properties: vec![CharacteristicProperty::Write],
-                permissions: vec![AttributePermission::Writeable],
+                permissions: vec![AttributePermission::WriteEncryptionRequired],
                 ..Default::default()
             },
             Characteristic {
                 uuid: Uuid::from_short(UUID_HID_PROTOCOL_MODE),
                 properties: vec![CharacteristicProperty::Read, CharacteristicProperty::Write],
-                permissions: vec![AttributePermission::Readable, AttributePermission::Writeable],
+                permissions: vec![
+                    AttributePermission::ReadEncryptionRequired,
+                    AttributePermission::WriteEncryptionRequired,
+                ],
                 value: Some(vec![0x01]),
                 ..Default::default()
             },
             Characteristic {
                 uuid: Uuid::from_short(UUID_HID_REPORT_MAP),
                 properties: vec![CharacteristicProperty::Read],
-                permissions: vec![AttributePermission::Readable],
+                permissions: vec![AttributePermission::ReadEncryptionRequired],
                 value: Some(report_map),
                 ..Default::default()
             },
             // Single Input Report characteristic carrying all RIDs
             Characteristic {
                 uuid: input_uuid,
-                properties: vec![CharacteristicProperty::Read, CharacteristicProperty::Notify],
-                permissions: vec![AttributePermission::Readable],
+                properties: vec![
+                    CharacteristicProperty::Read,
+                    CharacteristicProperty::NotifyEncryptionRequired,
+                ],
+                permissions: vec![AttributePermission::ReadEncryptionRequired],
                 ..Default::default()
             },
         ],
